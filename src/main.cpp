@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
+#include <SPI.h>
+#include <MD_AD9833.h>
 
 // --- Настройки Пинов ---
 #define DISP_CLOCK   3
@@ -11,11 +13,17 @@
 #define ENC_BTN_PIN  9  
 #define HARDWARE_LED 8
 
+#define DDS_CH1_FSYNC 7 // Пин выбора 1-го канала генератора
+
 // --- Инициализация объектов ---
 U8G2_ST7920_128X64_F_SW_SPI u8g2(U8G2_R0, DISP_CLOCK, DISP_DATA, DISP_CS, U8X8_PIN_NONE);
 
+// Создаем объект генератора для первого канала
+MD_AD9833 gen(DDS_CH1_FSYNC);
+
 // --- Глобальные переменные ---
-volatile int encoderCounter = 0;
+volatile int encoderCounter = 1000;
+int lastFrequency = 1000;
 bool buttonPressed = false;
 
 // Таблица состояний конечного автомата для энкодера.
@@ -52,8 +60,40 @@ void IRAM_ATTR readEncoderISR() {
   }
 }
 
-// --- Методы Инициализации (Setup) ---
+/*
+// --- Низкоуровневые методы управления AD9833 ---
+void dds_write(uint16_t data) {
+  // Настройки SPI: 4 МГц, MSBFIRST, SPI_MODE2 (для AD9833 такты CPOL=1, CPHA=0)
+  SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE2));
+  
+  digitalWrite(DDS_CH1_FSYNC, LOW);  // Активируем чип
+  SPI.transfer16(data);              // Передаем 16 бит данных
+  
+  digitalWrite(DDS_CH1_FSYNC, HIGH); // Деактивируем чип
+  SPI.endTransaction();
+}
 
+void dds_set_frequency(uint32_t frequency) {
+  // Рассчитываем 28-битное слово частоты для кварца 25 МГц
+  // Формула: (Freq * 2^28) / 25000000. Коэффициент равен 10.73741824
+  uint32_t freqWord = (uint32_t)((double)frequency * 10.73741824);
+
+  // Разбиваем 28 бит на два 14-битных куска
+  uint16_t freqLSB = (freqWord & 0x3FFF) | 0x4000;         // Регистр FREQ0 (Бит 14 = 0, Бит 15 = 1)
+  uint16_t freqMSB = ((freqWord >> 14) & 0x3FFF) | 0x4000;  // Туда же оставшиеся биты
+
+  // Важно: Управляющее слово БЕЗ полного Reset, но с битом B28=1 (загрузка в два захода)
+  // И с установленным битом MODE=1 (0x0002) для генерации ТРЕУГОЛЬНИКА
+  uint16_t controlWord = 0x2002;
+
+  // Отправляем последовательность
+  dds_write(controlWord); // Говорим чипу: "Сейчас загрузим частоту и включим треугольник"
+  dds_write(freqLSB);     // Шлем младшие 14 бит
+  dds_write(freqMSB);     // Шлем старшие 14 бит
+}
+*/
+
+// --- Методы Инициализации (Setup) ---
 void screen_init() {
   u8g2.begin();
   Serial.println("Экран успешно инициализирован.");
@@ -74,11 +114,43 @@ void encoder_init() {
   Serial.println("Энкодер (State Machine) и прерывания настроены.");
 }
 
+void dds_init() {
+  // Запуск железного SPI на пинах ESP32-C3: SCLK=4, MOSI=6
+  SPI.begin(4, -1, 6, -1); 
+  delay(10);
+
+  gen.begin(); // Внутренний сброс и подготовка чипа AD9833
+  
+  // Установка стартовых параметров
+  gen.setFrequency(MD_AD9833::CHAN_0, encoderCounter);
+  gen.setMode(MD_AD9833::MODE_TRIANGLE); // Включаем ТРЕУГОЛЬНИК
+  
+  Serial.println("Генератор инициализирован через MD_AD9833.");
+}
+
+/*
+void dds_init() {
+  pinMode(DDS_CH1_FSYNC, OUTPUT);
+  digitalWrite(DDS_CH1_FSYNC, HIGH); // Изначально отключаем шину генератора
+  
+  // Инициализируем аппаратный SPI
+  // По умолчанию на ESP32-C3: SCLK = GPIO4, MOSI = GPIO6
+  SPI.begin(4, -1, 6, -1); 
+  delay(10);
+  
+  // Сброс при старте
+  dds_write(0x2100); 
+  delay(10);
+  
+  dds_set_frequency(encoderCounter);
+  Serial.println("Генератор инициализирован в режим ТРЕУГОЛЬНИКА.");
+}
+*/
+
 void system_init() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("--- Старт модульной системы ---");
-  
+  Serial.println("--- DDS Generator System v1.0 ---");
   pinMode(HARDWARE_LED, OUTPUT);
 }
 
@@ -94,6 +166,16 @@ void check_encoder() {
   } else {
     digitalWrite(HARDWARE_LED, HIGH);
   }
+
+  // Если энкодер изменил значение — обновляем частоту "на лету"
+  if (encoderCounter != lastFrequency) {
+    gen.setFrequency(MD_AD9833::CHAN_0, encoderCounter); 
+    lastFrequency = encoderCounter;
+    
+    Serial.print("Частота: ");
+    Serial.print(encoderCounter);
+    Serial.println(" Гц");
+  }
 }
 
 void update_screen() {
@@ -101,24 +183,20 @@ void update_screen() {
   
   // Шапка
   u8g2.setFont(u8g2_font_7x14_tr); 
-  u8g2.drawStr(12, 20, "Encoder Test"); 
-  u8g2.drawLine(0, 26, 128, 26);
+  u8g2.drawStr(15, 18, "DDS Generator"); 
+  u8g2.drawLine(0, 24, 128, 24);
   
-  // Вывод значения энкодера
-  u8g2.setFont(u8g2_font_ncenB14_tr); 
-  char countStr[15];
-  sprintf(countStr, "Val: %d", encoderCounter);
-  u8g2.drawStr(15, 48, countStr);
-  
-  // Вывод статуса кнопки
+  // Инфо о канале 1
   u8g2.setFont(u8g2_font_6x10_tr);
-  if (buttonPressed) {
-    u8g2.drawStr(5, 62, "Button: CLICK!");
-  } else {
-    u8g2.drawStr(5, 62, "Button: Wait...");
-  }
+  u8g2.drawStr(5, 38, "CH1 Wave: TRIANGLE");
+  
+  // Крупный вывод текущей частоты
+  u8g2.setFont(u8g2_font_ncenB12_tr); 
+  char freqStr[20];
+  sprintf(freqStr, "F: %d Hz", encoderCounter);
+  u8g2.drawStr(5, 56, freqStr);
 
-  u8g2.sendBuffer();          
+  u8g2.sendBuffer();
 }
 
 void startup_message() {
@@ -143,6 +221,7 @@ void setup() {
   system_init();   // Базовые настройки МК и Serial
   screen_init();   // Настройка экрана
   encoder_init();  // Настройка энкодера
+  dds_init();
   startup_message();
 }
 
