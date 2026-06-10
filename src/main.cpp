@@ -8,11 +8,6 @@
 #define I2C_SDA 1  
 #define I2C_SCL 3
 
-// --- Настройки Пинов ---
-#define DISP_CLOCK   3
-#define DISP_DATA    1
-#define DISP_CS      5
-
 #define ENC_A_PIN    0
 #define ENC_B_PIN    2
 #define ENC_BTN_PIN  9  
