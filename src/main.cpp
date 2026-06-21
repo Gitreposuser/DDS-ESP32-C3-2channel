@@ -4,74 +4,55 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// Назначаем I2C на ваши прежние пины дисплея
-#define I2C_SDA 1  
-#define I2C_SCL 3
+// --- Конфигурация Периферии (Пины) ---
+#define I2C_SDA       1  
+#define I2C_SCL       3
 
-#define ENC_A_PIN    0
-#define ENC_B_PIN    2
-#define ENC_BTN_PIN  9  
-#define HARDWARE_LED 8
+#define ENC_A_PIN     0
+#define ENC_B_PIN     2
+#define ENC_BTN_PIN   9  
+#define HARDWARE_LED  8
 
-#define DDS_CH1_FSYNC 7 // Пин выбора 1-го канала генератора
+#define DDS_CH1_FSYNC 7 
+#define DDS_SCLK      4
+#define DDS_MOSI      6
 
-// Стандартный I2C адрес для модулей PCF8574 — обычно 0x27 (редко 0x3F)
-// Дисплей у нас 20 символов на 4 строки
+// --- Глобальные Объекты ---
 LiquidCrystal_I2C lcd(0x27, 20, 4);
-
-// Создаем объект генератора для первого канала
 MD_AD9833 gen(DDS_CH1_FSYNC);
 
-// --- Глобальные переменные ---
-volatile int encoderCounter = 1000;
-int lastFrequency = 1000;
+// --- Глобальные Состояния и Переменные ---
+volatile int encoderCounter = 1000; // Стартовая частота 1 кГц
+int lastFrequency = 0;              // 0 гарантирует обновление экрана при старте
 bool buttonPressed = false;
 
-// Таблица состояний конечного автомата для энкодера.
-// Она учитывает все стабильные переходы фаз и отсекает дребезг.
-// Индекс — это комбинация: [предыдущее_состояние_А_В][текущее_состояние_А_В]
-const int8_t encoderStates[] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
-volatile uint8_t oldState = 0;
+// --- Декларация тестовых методов (вынесены вниз) ---
+void debug_serial_pins();
+void debug_lcd_pins();
+void lcd_run_test_counters();
 
-// --- Корректный обработчик для энкодеров с фиксацией в положении 11 ---
+// =========================================================================
+// 1. МОДУЛЬ ЭНКОДЕРА (Обработчики и Инициализация)
+// =========================================================================
+
 void IRAM_ATTR readEncoderISR() {
-  oldState <<= 2;
-  oldState |= (digitalRead(ENC_A_PIN) << 1) | digitalRead(ENC_B_PIN);
+  bool aState = digitalRead(ENC_A_PIN);
+  bool bState = digitalRead(ENC_B_PIN);
+  static bool lastA = HIGH;
   
-  // Получаем направление движения из таблицы состояний
-  int8_t change = encoderStates[(oldState & 0x0F)];
-  
-  if (change != 0) {
-    // Накапливаем направление
-    static int8_t direction = 0;
-    direction += change;
-    
-    // Текущее состояние пинов (последние 2 бита)
-    uint8_t currentState = oldState & 0x03; 
-    
-    // Делаем шаг ТОЛЬКО тогда, когда энкодер встал на физический фиксатор (оба пина в HIGH -> 11 -> это 3 в десятичной)
-    if (currentState == 3) {
-      if (direction > 0) {
-        encoderCounter++;
-      } else if (direction < 0) {
-        encoderCounter--;
-      }
-      direction = 0; // Сбрасываем накопитель направления для следующего щелчка
+  // Метод определения направления по спаду фазы А
+  if (lastA == HIGH && aState == LOW) {
+    if (bState == HIGH) {
+      encoderCounter += 100; // Шаг вверх (100 Гц)
+    } else {
+      encoderCounter -= 100; // Шаг вниз (100 Гц)
     }
+    
+    // Ограничительные рамки по частоте
+    if (encoderCounter < 100) encoderCounter = 100;
+    if (encoderCounter > 5000000) encoderCounter = 5000000;
   }
-}
-
-// --- Методы Инициализации (Setup) ---
-void lcd_init() {
-  // Явно инициализируем шину I2C на наших кастомных пинах
-  Wire.begin(I2C_SDA, I2C_SCL);
-  
-  // Инициализация самого дисплея и включение подсветки
-  lcd.init();                      
-  lcd.backlight(); 
-  lcd.clear();
-  
-  Serial.println("Дисплей 2004A успешно инициализирован.");
+  lastA = aState;
 }
 
 void encoder_init() {
@@ -79,124 +60,183 @@ void encoder_init() {
   pinMode(ENC_B_PIN, INPUT_PULLUP);
   pinMode(ENC_BTN_PIN, INPUT_PULLUP);
   
-  // Читаем стартовое состояние пинов перед запуском прерываний
-  oldState = (digitalRead(ENC_A_PIN) << 1) | digitalRead(ENC_B_PIN);
+  // Стабильное прерывание строго по спаду уровня фазы А
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), readEncoderISR, FALLING);
   
-  // Вешаем прерывания на ОБА пина для отслеживания полной матрицы состояний
-  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), readEncoderISR, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), readEncoderISR, CHANGE);
-  
-  Serial.println("Энкодер (State Machine) и прерывания настроены.");
+  Serial.println("[ INIT ] Энкодер на прерывании FALLING настроен.");
 }
 
-void dds_init() {
-  // Запуск железного SPI на пинах ESP32-C3: SCLK=4, MOSI=6
-  SPI.begin(4, -1, 6, -1); 
-  delay(10);
-
-  gen.begin(); // Внутренний сброс и подготовка чипа AD9833
-  
-  // Установка стартовых параметров
-  gen.setFrequency(MD_AD9833::CHAN_0, encoderCounter);
-  gen.setMode(MD_AD9833::MODE_TRIANGLE); // Включаем ТРЕУГОЛЬНИК
-  
-  Serial.println("Генератор инициализирован через MD_AD9833.");
-}
-
-void system_init() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("--- DDS Generator System v1.0 ---");
-  pinMode(HARDWARE_LED, OUTPUT);
-}
-
-// --- Методы Рабочего Цикла (Loop) ---
-
-void check_encoder() {
-  // Опрашиваем состояние кнопки (нажата = true)
+void encoder_tick() {
+  // Опрос физического состояния кнопки
   buttonPressed = (digitalRead(ENC_BTN_PIN) == LOW);
   
-  // Управление светодиодом в зависимости от кнопки
-  if (buttonPressed) {
-    digitalWrite(HARDWARE_LED, LOW);
-  } else {
-    digitalWrite(HARDWARE_LED, HIGH);
-  }
+  // Управление встроенным светодиодом по нажатию
+  digitalWrite(HARDWARE_LED, buttonPressed ? LOW : HIGH);
+}
 
-  // Если энкодер изменил значение — обновляем частоту "на лету"
-  if (encoderCounter != lastFrequency) {
-    gen.setFrequency(MD_AD9833::CHAN_0, encoderCounter); 
-    lastFrequency = encoderCounter;
+// =========================================================================
+// 2. МОДУЛЬ ДИСПЛЕЯ (Интерфейс и Отрисовка)
+// =========================================================================
+
+void lcd_init() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  lcd.init();                      
+  lcd.backlight(); 
+  lcd.clear();
+  Serial.println("[ INIT ] Дисплей I2C 2004A запущен.");
+}
+
+void lcd_draw_interface() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("DDS Generator v1.5");
+  lcd.setCursor(0, 1);
+  lcd.print("--------------------"); 
+  lcd.setCursor(0, 2);
+  lcd.print(" CH1 Freq: ");
+  lcd.setCursor(0, 3);
+  lcd.print(" CH1 Duty: 50 %");
+}
+
+void lcd_tick() {
+  int currentFreq;
+  
+  // Атомарное чтение переменной из прерывания
+  noInterrupts();
+  currentFreq = encoderCounter;
+  interrupts();
+
+  // Обновление значения частоты на экране при изменениях
+  if (currentFreq != lastFrequency) {
+    lastFrequency = currentFreq;
     
-    Serial.print("Частота: ");
-    Serial.print(encoderCounter);
+    lcd.setCursor(11, 2);
+    lcd.print(currentFreq);
+    lcd.print(" Hz      "); // Пробелы стирают артефакты старых цифр
+  }
+}
+
+void startup_message() {
+  lcd.setCursor(3, 1);
+  lcd.print("DDS Generator");
+  delay(1000);      
+}
+
+// =========================================================================
+// 3. МОДУЛЬ СИНТЕЗАТОРА ЧАСТОТЫ (AD9833 DDS)
+// =========================================================================
+
+void dds_init() {
+  SPI.begin(DDS_SCLK, -1, DDS_MOSI, -1); 
+  delay(10);
+
+  gen.begin(); 
+  gen.setFrequency(MD_AD9833::CHAN_0, encoderCounter);
+  gen.setMode(MD_AD9833::MODE_TRIANGLE); 
+  
+  Serial.println("[ INIT ] Чип AD9833 инициализирован.");
+}
+
+void dds_tick() {
+  static int ddsLastFreq = 0;
+  int currentFreq;
+
+  noInterrupts();
+  currentFreq = encoderCounter;
+  interrupts();
+
+  // Обновляем частоту в самом чипе только при реальном сдвиге частоты
+  if (currentFreq != ddsLastFreq) {
+    ddsLastFreq = currentFreq;
+    gen.setFrequency(MD_AD9833::CHAN_0, currentFreq);
+    
+    Serial.print("[ DDS ] Частота изменена: ");
+    Serial.print(currentFreq);
     Serial.println(" Гц");
   }
 }
 
-// Базовый метод для вывода статического интерфейса
-void lcd_draw_interface() {
-  lcd.setCursor(0, 0);
-  lcd.print("DDS Generator v1.5");
-  lcd.setCursor(0, 1);
-  lcd.print("--------------------"); // Разделительная линия на 20 символов
-  lcd.setCursor(0, 2);
-  lcd.print("CH1 Freq: ---- Hz");
-  lcd.setCursor(0, 3);
-  lcd.print("CH1 Duty: -- %");
+// =========================================================================
+// 4. СИСТЕМНЫЙ МОДУЛЬ И ЯДРО
+// =========================================================================
+
+void system_init() {
+  Serial.begin(115200);
+  
+  unsigned long startWait = millis();
+  while (!Serial && (millis() - startWait < 3000)) {
+    delay(10);
+  }
+
+  Serial.println("\n=== SYSTEM START ===");
+  pinMode(HARDWARE_LED, OUTPUT);
 }
 
-// Метод динамического обновления тестовых данных
+void setup() {
+  system_init();      // Запуск базовых систем
+  lcd_init();         // Инициализация экрана
+  encoder_init();     // Инициализация крутилки
+  dds_init();         // Инициализация генератора (Если зависает — временно закомментировать)
+  
+  startup_message();  
+  lcd_draw_interface(); 
+}
+
+void loop() {
+  // Основной рабочий цикл (без мусора и тестов)
+  encoder_tick();     // Опрос кнопки и светодиода
+  dds_tick();         // Мониторинг изменений и отправка в AD9833
+  lcd_tick();         // Мониторинг изменений и вывод на дисплей
+
+  // --- МЕСТО ДЛЯ ТЕСТОВ (Раскомментировать при необходимости) ---
+  // debug_lcd_pins();     // Вывод состояния пинов в верхнюю строку экрана
+  // debug_serial_pins();  // Вывод состояния пинов в последовательный порт
+  // lcd_run_test_counters(); // Искусственный бег цифр на экране
+  
+  delay(10); // Защита от перегрузки процессора
+}
+
+// =========================================================================
+// 5. ИЗОЛИРОВАННЫЕ ТЕСТОВЫЕ МЕТОДЫ (Отладка)
+// =========================================================================
+
+void debug_lcd_pins() {
+  lcd.setCursor(0, 0);
+  lcd.print("A:"); lcd.print(digitalRead(ENC_A_PIN));
+  lcd.print(" B:"); lcd.print(digitalRead(ENC_B_PIN));
+  lcd.print(" BTN:"); lcd.print(digitalRead(ENC_BTN_PIN));
+  lcd.print("    "); 
+}
+
+void debug_serial_pins() {
+  static unsigned long lastLog = 0;
+  if (millis() - lastLog >= 100) {
+    lastLog = millis();
+    Serial.print("A: "); Serial.print(digitalRead(ENC_A_PIN));
+    Serial.print(" | B: "); Serial.println(digitalRead(ENC_B_PIN));
+  }
+}
+
 void lcd_run_test_counters() {
   static unsigned long lastUpdate = 0;
   static int testFreq = 1000;
   static int testDuty = 50;
   static bool direction = true;
 
-  // Обновляем данные на экране раз в 100 миллисекунд (без блокирующего delay)
   if (millis() - lastUpdate >= 100) {
     lastUpdate = millis();
 
-    // Симулируем изменение параметров для проверки динамики экрана
     if (direction) {
-      testFreq += 100;
-      testDuty += 1;
+      testFreq += 100; testDuty += 1;
       if (testFreq >= 5000) direction = false;
     } else {
-      testFreq -= 100;
-      testDuty -= 1;
+      testFreq -= 100; testDuty -= 1;
       if (testFreq <= 100) direction = true;
     }
 
-    // Выводим только изменяющиеся значения, чтобы экран не мерцал
-    // Очищаем старые цифры пробелами, если разрядность падает
-    lcd.setCursor(10, 2);
-    lcd.print(testFreq);
-    lcd.print("    "); // Затираем хвосты
-
-    lcd.setCursor(10, 3);
-    lcd.print(testDuty);
-    lcd.print("  ");   // Затираем хвосты
+    lcd.setCursor(11, 2);
+    lcd.print(testFreq); lcd.print(" Hz   "); 
+    lcd.setCursor(11, 3);
+    lcd.print(testDuty); lcd.print(" %  ");   
   }
-}
-
-void startup_message() {
-  lcd.print("DDS Generator");
-  delay(1000);      
-}
-
-// --- Главные функции Arduino ---
-void setup() {
-  system_init();   // Базовые настройки МК и Serial
-  lcd_init();      // Запуск I2C и экрана
-  encoder_init();  // Настройка энкодера
-  dds_init();
-  startup_message();
-  lcd_draw_interface(); // Рисуем каркас меню один раз при старте
-}
-
-void loop() {
-  check_encoder(); // Опрос кнопок и периферии
-  lcd_run_test_counters();
-  delay(30);       // Небольшая пауза для стабильности интерфейса
 }
