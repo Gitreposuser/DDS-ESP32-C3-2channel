@@ -39,10 +39,11 @@ MD_AD9833 genCH2(DDS_CH2_FSYNC);
 volatile int encoderCounter = 1000; // Стартовая частота 1 кГц
 int lastFrequency = 0;              // 0 гарантирует обновление экрана при старте
 bool buttonPressed = false;
+volatile bool change = false;
 
 // Начальные значения скважности для каналов (128 из 255 соответствует 50% скважности)
-int dutyCH1 = 8;
-int dutyCH2 = 8;
+volatile int dutyCH1 = 128;
+volatile int dutyCH2 = 128;
 
 // --- Декларация тестовых методов (вынесены вниз) ---
 void debug_serial_pins();
@@ -63,14 +64,22 @@ void IRAM_ATTR readEncoderISR() {
   // Метод определения направления по спаду фазы А
   if (lastA == HIGH && aState == LOW) {
     if (bState == HIGH) {
-      encoderCounter += 100; // Шаг вверх (100 Гц)
+      //encoderCounter += 100; // Шаг вверх (100 Гц)
+
+      ++dutyCH1;
+      ++dutyCH2;
     } else {
-      encoderCounter -= 100; // Шаг вниз (100 Гц)
+      //encoderCounter -= 100; // Шаг вниз (100 Гц)
+
+      --dutyCH1;
+      --dutyCH2;
     }
     
     // Ограничительные рамки по частоте
     if (encoderCounter < 100) encoderCounter = 100;
     if (encoderCounter > 5000000) encoderCounter = 5000000;
+
+    change = true;  // Change in state detected
   }
   lastA = aState;
 }
@@ -100,34 +109,48 @@ void lcd_init() {
   lcd.clear();
 }
 
-void lcd_draw_interface() {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("DDS Generator v1.5");
-  lcd.setCursor(0, 1);
-  lcd.print("--------------------"); 
-  lcd.setCursor(0, 2);
-  lcd.print(" CH1 Freq: ");
-  lcd.setCursor(0, 3);
-  lcd.print(" CH1 Duty: 50 %");
+void lcd_tick() {
+ // 1. Отрисовка Частоты (Строка 2, начиная с 10-го столбца)
+  lcd.setCursor(10, 2);
+  lcd.print(encoderCounter);
+  lcd.print(" Hz      "); // Пробелы затирают старые хвосты длинных чисел
+
+  // 2. Отрисовка Скважности (Строка 3, начиная с 10-го столбца)
+  int dutyPercent1 = map(dutyCH1, 0, 255, 0, 100);
+  lcd.setCursor(10, 3);
+  
+  // Форматирование пробелами для красивого выравнивания
+  if (dutyPercent1 < 10) {
+    lcd.print("  ");
+  } else if (dutyPercent1 < 100) {
+    lcd.print(" ");
+  }
+  
+  lcd.print(dutyPercent1);
+  lcd.print("%   ");
 }
 
-void lcd_tick() {
-  int currentFreq;
+void lcd_draw_interface() {
+ lcd.clear();
   
-  // Атомарное чтение переменной из прерывания
-  noInterrupts();
-  currentFreq = encoderCounter;
-  interrupts();
-
-  // Обновление значения частоты на экране при изменениях
-  if (currentFreq != lastFrequency) {
-    lastFrequency = currentFreq;
-    
-    lcd.setCursor(11, 2);
-    lcd.print(currentFreq);
-    lcd.print(" Hz      "); // Пробелы стирают артефакты старых цифр
-  }
+  // Строка 0: Заголовок
+  lcd.setCursor(0, 0);
+  lcd.print("DDS Generator v1.5");
+  
+  // Строка 1: Разделительная полоса
+  lcd.setCursor(0, 1);
+  lcd.print("--------------------"); 
+  
+  // Строка 2: Статическая метка частоты
+  lcd.setCursor(0, 2);
+  lcd.print("CH1 Freq: ");
+  
+  // Строка 3: Статическая метка скважности
+  lcd.setCursor(0, 3);          
+  lcd.print("CH1 Duty: ");
+  
+  // Принудительно отрисовываем начальные значения на экране
+  lcd_tick();
 }
 
 void startup_message() {
@@ -162,15 +185,12 @@ void dds_tick() {
   noInterrupts();
   currentFreq = encoderCounter;
   interrupts();
+ 
+  // Библиотека сама опустит и поднимет нужный FSYNC во время отправки данных по SPI
+  genCH1.setFrequency(MD_AD9833::CHAN_0, currentFreq);
+  genCH2.setFrequency(MD_AD9833::CHAN_0, currentFreq);
 
-  // Синхронно обновляем частоту в обоих чипах при ее изменении энкодером
-  if (currentFreq != ddsLastFreq) {
-    ddsLastFreq = currentFreq;
-    
-    // Библиотека сама опустит и поднимет нужный FSYNC во время отправки данных по SPI
-    genCH1.setFrequency(MD_AD9833::CHAN_0, currentFreq);
-    genCH2.setFrequency(MD_AD9833::CHAN_0, currentFreq);
-  }
+  set_channels_duty(dutyCH1, dutyCH2);
 }
 
 // =========================================================================
@@ -264,8 +284,12 @@ void setup() {
 void loop() {
   // Основной рабочий цикл (без мусора и тестов)
   encoder_tick();     // Опрос кнопки и светодиода
-  dds_tick();         // Мониторинг изменений и отправка в AD9833
-  lcd_tick();         // Мониторинг изменений и вывод на дисплей
+
+  if(change) {
+    lcd_tick();
+    dds_tick();
+    change = false;
+  }
 
   delay(10); // Защита от перегрузки процессора
 }
