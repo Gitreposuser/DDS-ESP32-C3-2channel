@@ -36,14 +36,22 @@ MD_AD9833 genCH1(DDS_CH1_FSYNC);
 MD_AD9833 genCH2(DDS_CH2_FSYNC);
 
 // --- Глобальные Состояния и Переменные ---
-volatile int encoderCounter = 1000; // Стартовая частота 1 кГц
-int lastFrequency = 0;              // 0 гарантирует обновление экрана при старте
-bool buttonPressed = false;
-volatile bool change = false;
+volatile int encoderDelta = 0;
+int frequencyCH1 = 1000;
+int frequencyCH2 = 1000;
+int phaseCH1 = 0;
+int phaseCH2 = 0;
+bool channelCH1Enabled = true;
+bool channelCH2Enabled = true;
+int selectedMenuItem = 0;
+bool editingMenuItem = false;
+bool menuNeedsRedraw = true;
+bool lastButtonState = HIGH;
+unsigned long lastButtonChange = 0;
 
 // Начальные значения скважности для каналов (128 из 255 соответствует 50% скважности)
-volatile int dutyCH1 = 128;
-volatile int dutyCH2 = 128;
+int dutyCH1 = 128;
+int dutyCH2 = 128;
 
 // --- Декларация тестовых методов (вынесены вниз) ---
 void debug_serial_pins();
@@ -64,22 +72,10 @@ void IRAM_ATTR readEncoderISR() {
   // Метод определения направления по спаду фазы А
   if (lastA == HIGH && aState == LOW) {
     if (bState == HIGH) {
-      //encoderCounter += 100; // Шаг вверх (100 Гц)
-
-      ++dutyCH1;
-      ++dutyCH2;
+      ++encoderDelta;
     } else {
-      //encoderCounter -= 100; // Шаг вниз (100 Гц)
-
-      --dutyCH1;
-      --dutyCH2;
+      --encoderDelta;
     }
-    
-    // Ограничительные рамки по частоте
-    if (encoderCounter < 100) encoderCounter = 100;
-    if (encoderCounter > 5000000) encoderCounter = 5000000;
-
-    change = true;  // Change in state detected
   }
   lastA = aState;
 }
@@ -94,8 +90,16 @@ void encoder_init() {
 }
 
 void encoder_tick() {
-  // Опрос физического состояния кнопки
-  buttonPressed = (digitalRead(ENC_BTN_PIN) == LOW);
+  bool buttonState = digitalRead(ENC_BTN_PIN);
+  unsigned long now = millis();
+  if (buttonState != lastButtonState && now - lastButtonChange >= 30) {
+    lastButtonChange = now;
+    lastButtonState = buttonState;
+    if (buttonState == LOW) {
+      editingMenuItem = !editingMenuItem;
+      menuNeedsRedraw = true;
+    }
+  }
 }
 
 // =========================================================================
@@ -109,47 +113,76 @@ void lcd_init() {
   lcd.clear();
 }
 
-void lcd_tick() {
- // 1. Отрисовка Частоты (Строка 2, начиная с 10-го столбца)
-  lcd.setCursor(10, 2);
-  lcd.print(encoderCounter);
-  lcd.print(" Hz      "); // Пробелы затирают старые хвосты длинных чисел
+void lcd_print_three_digits(int value) {
+  lcd.print((value / 100) % 10);
+  lcd.print((value / 10) % 10);
+  lcd.print(value % 10);
+}
 
-  // 2. Отрисовка Скважности (Строка 3, начиная с 10-го столбца)
-  int dutyPercent1 = map(dutyCH1, 0, 255, 0, 100);
-  lcd.setCursor(10, 3);
-  
-  // Форматирование пробелами для красивого выравнивания
-  if (dutyPercent1 < 10) {
-    lcd.print("  ");
-  } else if (dutyPercent1 < 100) {
-    lcd.print(" ");
+void lcd_draw_channel(int channel) {
+  int row = channel * 2;
+  int frequency = channel == 0 ? frequencyCH1 : frequencyCH2;
+  int duty = channel == 0 ? dutyCH1 : dutyCH2;
+  int phase = channel == 0 ? phaseCH1 : phaseCH2;
+  bool enabled = channel == 0 ? channelCH1Enabled : channelCH2Enabled;
+
+  lcd.setCursor(0, row);
+  lcd.print(channel == 0 ? "CH1 " : "CH2 ");
+  lcd.print(frequency / 1000000);
+  lcd.print(' ');
+  lcd_print_three_digits((frequency / 1000) % 1000);
+  lcd.print(' ');
+  lcd_print_three_digits(frequency % 1000);
+  lcd.print("Hz");
+
+  lcd.setCursor(0, row + 1);
+  lcd.print("D ");
+  lcd_print_three_digits(map(duty, 0, 255, 0, 100));
+  lcd.print("% P ");
+  lcd_print_three_digits(phase);
+  lcd.print(' ');
+  lcd.print(enabled ? "ON " : "OFF");
+}
+
+void lcd_cursor_position(int item, int &column, int &row) {
+  static const int frequencyColumns[] = { 4, 6, 7, 8, 10, 11, 12 };
+  int channel = item / 14;
+  int symbol = item % 14;
+  row = channel * 2;
+
+  if (symbol < 7) {
+    column = frequencyColumns[symbol];
+  } else {
+    row += 1;
+    if (symbol < 10) {
+      column = 2 + symbol - 7;
+    } else if (symbol < 13) {
+      column = 9 + symbol - 10;
+    } else {
+      column = 13;
+    }
   }
-  
-  lcd.print(dutyPercent1);
-  lcd.print("%   ");
+}
+
+void lcd_tick() {
+  lcd.clear();
+  lcd_draw_channel(0);
+  lcd_draw_channel(1);
+
+  int cursorColumn;
+  int cursorRow;
+  lcd_cursor_position(selectedMenuItem, cursorColumn, cursorRow);
+  lcd.setCursor(cursorColumn, cursorRow);
+  if (editingMenuItem) {
+    lcd.cursor();
+    lcd.noBlink();
+  } else {
+    lcd.noCursor();
+    lcd.blink();
+  }
 }
 
 void lcd_draw_interface() {
- lcd.clear();
-  
-  // Строка 0: Заголовок
-  lcd.setCursor(0, 0);
-  lcd.print("DDS Generator v1.5");
-  
-  // Строка 1: Разделительная полоса
-  lcd.setCursor(0, 1);
-  lcd.print("--------------------"); 
-  
-  // Строка 2: Статическая метка частоты
-  lcd.setCursor(0, 2);
-  lcd.print("CH1 Freq: ");
-  
-  // Строка 3: Статическая метка скважности
-  lcd.setCursor(0, 3);          
-  lcd.print("CH1 Duty: ");
-  
-  // Принудительно отрисовываем начальные значения на экране
   lcd_tick();
 }
 
@@ -169,26 +202,25 @@ void dds_init() {
 
   // Инициализация Канала 1 (GPIO 7)
   genCH1.begin(); 
-  genCH1.setFrequency(MD_AD9833::CHAN_0, encoderCounter);
+  genCH1.setFrequency(MD_AD9833::CHAN_0, frequencyCH1);
+  genCH1.setPhase(MD_AD9833::CHAN_0, phaseCH1 * 10);
   genCH1.setMode(MD_AD9833::MODE_TRIANGLE); // Установка режима ПРЯМОУГОЛЬНИК (меандр)
   
   // Инициализация Канала 2 (GPIO 10)
   genCH2.begin(); 
-  genCH2.setFrequency(MD_AD9833::CHAN_0, encoderCounter);
+  genCH2.setFrequency(MD_AD9833::CHAN_0, frequencyCH2);
+  genCH2.setPhase(MD_AD9833::CHAN_0, phaseCH2 * 10);
   genCH2.setMode(MD_AD9833::MODE_TRIANGLE); // Установка режима ПРЯМОУГОЛЬНИК (меандр)
 }
 
 void dds_tick() {
-  static int ddsLastFreq = 0;
-  int currentFreq;
+  genCH1.setFrequency(MD_AD9833::CHAN_0, frequencyCH1);
+  genCH1.setPhase(MD_AD9833::CHAN_0, phaseCH1 * 10);
+  genCH1.setMode(channelCH1Enabled ? MD_AD9833::MODE_TRIANGLE : MD_AD9833::MODE_OFF);
 
-  noInterrupts();
-  currentFreq = encoderCounter;
-  interrupts();
- 
-  // Библиотека сама опустит и поднимет нужный FSYNC во время отправки данных по SPI
-  genCH1.setFrequency(MD_AD9833::CHAN_0, currentFreq);
-  genCH2.setFrequency(MD_AD9833::CHAN_0, currentFreq);
+  genCH2.setFrequency(MD_AD9833::CHAN_0, frequencyCH2);
+  genCH2.setPhase(MD_AD9833::CHAN_0, phaseCH2 * 10);
+  genCH2.setMode(channelCH2Enabled ? MD_AD9833::MODE_TRIANGLE : MD_AD9833::MODE_OFF);
 
   set_channels_duty(dutyCH1, dutyCH2);
 }
@@ -282,14 +314,48 @@ void setup() {
 }
 
 void loop() {
-  // Основной рабочий цикл (без мусора и тестов)
-  encoder_tick();     // Опрос кнопки и светодиода
+  encoder_tick();
 
-  if(change) {
-    lcd_tick();
-    dds_tick();
-    change = false;
+  int delta;
+  noInterrupts();
+  delta = encoderDelta;
+  encoderDelta = 0;
+  interrupts();
+
+  if (delta != 0) {
+    if (editingMenuItem) {
+      int channel = selectedMenuItem / 14;
+      int symbol = selectedMenuItem % 14;
+
+      if (symbol < 7) {
+        static const int placeValues[] = { 1000000, 100000, 10000, 1000, 100, 10, 1 };
+        int &frequency = channel == 0 ? frequencyCH1 : frequencyCH2;
+        frequency = constrain(frequency + delta * placeValues[symbol], 100, 5000000);
+      } else if (symbol < 10) {
+        int &duty = channel == 0 ? dutyCH1 : dutyCH2;
+        int dutyPercent = map(duty, 0, 255, 0, 100);
+        static const int placeValues[] = { 100, 10, 1 };
+        dutyPercent = constrain(dutyPercent + delta * placeValues[symbol - 7], 0, 100);
+        duty = map(dutyPercent, 0, 100, 0, 255);
+      } else if (symbol < 13) {
+        int &phase = channel == 0 ? phaseCH1 : phaseCH2;
+        static const int placeValues[] = { 100, 10, 1 };
+        phase = constrain(phase + delta * placeValues[symbol - 10], 0, 360);
+      } else {
+        bool &enabled = channel == 0 ? channelCH1Enabled : channelCH2Enabled;
+        enabled = delta > 0;
+      }
+      dds_tick();
+    } else {
+      selectedMenuItem = (selectedMenuItem + delta % 28 + 28) % 28;
+    }
+    menuNeedsRedraw = true;
   }
 
-  delay(10); // Защита от перегрузки процессора
+  if (menuNeedsRedraw) {
+    lcd_tick();
+    menuNeedsRedraw = false;
+  }
+
+  delay(10);
 }
