@@ -37,6 +37,8 @@ MD_AD9833 genCH2(DDS_CH2_FSYNC);
 
 // --- Глобальные Состояния и Переменные ---
 volatile int encoderDelta = 0;
+volatile uint8_t encoderPreviousState = 0;
+volatile int8_t encoderTransition = 0;
 int frequencyCH1 = 1000;
 int frequencyCH2 = 1000;
 int phaseCH1 = 0;
@@ -45,13 +47,13 @@ bool channelCH1Enabled = true;
 bool channelCH2Enabled = true;
 int selectedMenuItem = 0;
 bool editingMenuItem = false;
-bool menuNeedsRedraw = true;
+bool buttonPressDetected = false;
 bool lastButtonState = HIGH;
 unsigned long lastButtonChange = 0;
 
-// Начальные значения скважности для каналов (128 из 255 соответствует 50% скважности)
-int dutyCH1 = 128;
-int dutyCH2 = 128;
+// Duty values are kept as percentages; PWM counts are calculated at output.
+int dutyCH1 = 50;
+int dutyCH2 = 50;
 
 // --- Декларация тестовых методов (вынесены вниз) ---
 void debug_serial_pins();
@@ -65,28 +67,39 @@ void set_channels_duty(int duty1, int duty2);
 // =========================================================================
 
 void IRAM_ATTR readEncoderISR() {
-  bool aState = digitalRead(ENC_A_PIN);
-  bool bState = digitalRead(ENC_B_PIN);
-  static bool lastA = HIGH;
-  
-  // Метод определения направления по спаду фазы А
-  if (lastA == HIGH && aState == LOW) {
-    if (bState == HIGH) {
-      ++encoderDelta;
-    } else {
-      --encoderDelta;
-    }
+  uint8_t currentState = (digitalRead(ENC_A_PIN) << 1) | digitalRead(ENC_B_PIN);
+  uint8_t previousState = encoderPreviousState;
+  encoderPreviousState = currentState;
+
+  uint8_t changedBits = previousState ^ currentState;
+  if (changedBits == 0) {
+    return;
   }
-  lastA = aState;
+  if (changedBits == 3) {
+    encoderTransition = 0;
+    return;
+  }
+
+  int8_t direction = ((previousState & 1) != (currentState >> 1)) ? 1 : -1;
+  encoderTransition += direction;
+  if (encoderTransition >= 4) {
+    ++encoderDelta;
+    encoderTransition = 0;
+  } else if (encoderTransition <= -4) {
+    --encoderDelta;
+    encoderTransition = 0;
+  }
 }
 
 void encoder_init() {
   pinMode(ENC_A_PIN, INPUT_PULLUP);
   pinMode(ENC_B_PIN, INPUT_PULLUP);
   pinMode(ENC_BTN_PIN, INPUT_PULLUP);
-  
-  // Стабильное прерывание строго по спаду уровня фазы А
-  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), readEncoderISR, FALLING);
+
+  encoderPreviousState = (digitalRead(ENC_A_PIN) << 1) | digitalRead(ENC_B_PIN);
+  encoderTransition = 0;
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), readEncoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), readEncoderISR, CHANGE);
 }
 
 void encoder_tick() {
@@ -96,8 +109,7 @@ void encoder_tick() {
     lastButtonChange = now;
     lastButtonState = buttonState;
     if (buttonState == LOW) {
-      editingMenuItem = !editingMenuItem;
-      menuNeedsRedraw = true;
+      buttonPressDetected = true;
     }
   }
 }
@@ -137,7 +149,7 @@ void lcd_draw_channel(int channel) {
 
   lcd.setCursor(0, row + 1);
   lcd.print("D ");
-  lcd_print_three_digits(map(duty, 0, 255, 0, 100));
+  lcd_print_three_digits(duty);
   lcd.print("% P ");
   lcd_print_three_digits(phase);
   lcd.print(' ');
@@ -164,11 +176,7 @@ void lcd_cursor_position(int item, int &column, int &row) {
   }
 }
 
-void lcd_tick() {
-  lcd.clear();
-  lcd_draw_channel(0);
-  lcd_draw_channel(1);
-
+void lcd_update_cursor() {
   int cursorColumn;
   int cursorRow;
   lcd_cursor_position(selectedMenuItem, cursorColumn, cursorRow);
@@ -182,8 +190,63 @@ void lcd_tick() {
   }
 }
 
+void lcd_draw_enabled(int channel) {
+  int row = channel * 2 + 1;
+  bool enabled = channel == 0 ? channelCH1Enabled : channelCH2Enabled;
+  lcd.setCursor(13, row);
+  lcd.print(enabled ? "ON " : "OFF");
+  lcd_update_cursor();
+}
+
+void lcd_draw_symbol(int item) {
+  int channel = item / 14;
+  int symbol = item % 14;
+  if (symbol == 13) {
+    lcd_draw_enabled(channel);
+    return;
+  }
+
+  int value;
+  int place;
+  if (symbol < 7) {
+    static const int placeValues[] = { 1000000, 100000, 10000, 1000, 100, 10, 1 };
+    int frequency = channel == 0 ? frequencyCH1 : frequencyCH2;
+    value = frequency;
+    place = placeValues[symbol];
+  } else if (symbol < 10) {
+    int duty = channel == 0 ? dutyCH1 : dutyCH2;
+    value = duty;
+    static const int placeValues[] = { 100, 10, 1 };
+    place = placeValues[symbol - 7];
+  } else {
+    static const int placeValues[] = { 100, 10, 1 };
+    int phase = channel == 0 ? phaseCH1 : phaseCH2;
+    value = phase;
+    place = placeValues[symbol - 10];
+  }
+
+  int cursorColumn;
+  int cursorRow;
+  lcd_cursor_position(item, cursorColumn, cursorRow);
+  lcd.setCursor(cursorColumn, cursorRow);
+  lcd.print((value / place) % 10);
+  lcd_update_cursor();
+}
+
+void lcd_draw_changed_digits(int channel, int firstSymbol, int previousValue, int value,
+                             const int *placeValues, int digitCount) {
+  for (int digit = 0; digit < digitCount; ++digit) {
+    if ((previousValue / placeValues[digit]) % 10 != (value / placeValues[digit]) % 10) {
+      lcd_draw_symbol(channel * 14 + firstSymbol + digit);
+    }
+  }
+}
+
 void lcd_draw_interface() {
-  lcd_tick();
+  lcd.clear();
+  lcd_draw_channel(0);
+  lcd_draw_channel(1);
+  lcd_update_cursor();
 }
 
 void startup_message() {
@@ -266,17 +329,17 @@ void lcd_run_test_counters() {
 // =========================================================================
 
 void set_channels_duty(int duty1, int duty2) {
-  dutyCH1 = constrain(duty1, 0, 255);
-  dutyCH2 = constrain(duty2, 0, 255);
+  int pwmDuty1 = map(constrain(duty1, 0, 100), 0, 100, 0, 255);
+  int pwmDuty2 = map(constrain(duty2, 0, 100), 0, 100, 0, 255);
 
 #if defined(ESP_IDF_VERSION_MAJOR) && (ESP_IDF_VERSION_MAJOR >= 5)
   // Arduino ESP32 v3.x
-  ledcWrite(PWM_CH1_PIN, dutyCH1);
-  ledcWrite(PWM_CH2_PIN, dutyCH2);
+  ledcWrite(PWM_CH1_PIN, pwmDuty1);
+  ledcWrite(PWM_CH2_PIN, pwmDuty2);
 #else
   // Arduino ESP32 v2.x
-  ledcWrite(0, dutyCH1); // Канал 0
-  ledcWrite(1, dutyCH2); // Канал 1
+  ledcWrite(0, pwmDuty1); // Канал 0
+  ledcWrite(1, pwmDuty2); // Канал 1
 #endif
 }
 
@@ -316,6 +379,20 @@ void setup() {
 void loop() {
   encoder_tick();
 
+  if (buttonPressDetected) {
+    buttonPressDetected = false;
+    if (selectedMenuItem % 14 == 13) {
+      int channel = selectedMenuItem / 14;
+      bool &enabled = channel == 0 ? channelCH1Enabled : channelCH2Enabled;
+      enabled = !enabled;
+      dds_tick();
+      lcd_draw_enabled(channel);
+    } else {
+      editingMenuItem = !editingMenuItem;
+      lcd_update_cursor();
+    }
+  }
+
   int delta;
   noInterrupts();
   delta = encoderDelta;
@@ -330,31 +407,29 @@ void loop() {
       if (symbol < 7) {
         static const int placeValues[] = { 1000000, 100000, 10000, 1000, 100, 10, 1 };
         int &frequency = channel == 0 ? frequencyCH1 : frequencyCH2;
-        frequency = constrain(frequency + delta * placeValues[symbol], 100, 5000000);
+        int previousFrequency = frequency;
+        frequency = constrain(frequency + delta * placeValues[symbol], 0, 5000000);
+        dds_tick();
+        lcd_draw_changed_digits(channel, 0, previousFrequency, frequency, placeValues, 7);
       } else if (symbol < 10) {
         int &duty = channel == 0 ? dutyCH1 : dutyCH2;
-        int dutyPercent = map(duty, 0, 255, 0, 100);
+        int previousDuty = duty;
         static const int placeValues[] = { 100, 10, 1 };
-        dutyPercent = constrain(dutyPercent + delta * placeValues[symbol - 7], 0, 100);
-        duty = map(dutyPercent, 0, 100, 0, 255);
+        duty = constrain(duty + delta * placeValues[symbol - 7], 0, 100);
+        dds_tick();
+        lcd_draw_changed_digits(channel, 7, previousDuty, duty, placeValues, 3);
       } else if (symbol < 13) {
         int &phase = channel == 0 ? phaseCH1 : phaseCH2;
+        int previousPhase = phase;
         static const int placeValues[] = { 100, 10, 1 };
         phase = constrain(phase + delta * placeValues[symbol - 10], 0, 360);
-      } else {
-        bool &enabled = channel == 0 ? channelCH1Enabled : channelCH2Enabled;
-        enabled = delta > 0;
+        dds_tick();
+        lcd_draw_changed_digits(channel, 10, previousPhase, phase, placeValues, 3);
       }
-      dds_tick();
     } else {
       selectedMenuItem = (selectedMenuItem + delta % 28 + 28) % 28;
+      lcd_update_cursor();
     }
-    menuNeedsRedraw = true;
-  }
-
-  if (menuNeedsRedraw) {
-    lcd_tick();
-    menuNeedsRedraw = false;
   }
 
   delay(10);
