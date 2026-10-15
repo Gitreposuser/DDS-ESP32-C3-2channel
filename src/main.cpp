@@ -14,8 +14,8 @@
 #define ENC_BTN_PIN   9  
 
 // Пины выбора чипов (FSYNC) для двух каналов расширения
-#define DDS_CH1_FSYNC 7 
-#define DDS_CH2_FSYNC 10
+#define DDS_CH1_FSYNC 10
+#define DDS_CH2_FSYNC 7
 
 #define DDS_SCLK      4
 #define DDS_MOSI      6
@@ -259,21 +259,43 @@ void startup_message() {
 // 3. МОДУЛЬ СИНТЕЗАТОРА ЧАСТОТЫ (AD9833 DDS)
 // =========================================================================
 
+void dds_broadcast_control(uint16_t controlWord) {
+  SPI.beginTransaction(SPISettings(14000000, MSBFIRST, SPI_MODE2));
+  digitalWrite(DDS_CH1_FSYNC, LOW);
+  digitalWrite(DDS_CH2_FSYNC, LOW);
+  SPI.transfer16(controlWord);
+  digitalWrite(DDS_CH1_FSYNC, HIGH);
+  digitalWrite(DDS_CH2_FSYNC, HIGH);
+  SPI.endTransaction();
+}
+
 void dds_init() {
   SPI.begin(DDS_SCLK, -1, DDS_MOSI, -1); 
   delay(10);
 
-  // Инициализация Канала 1 (GPIO 7)
-  genCH1.begin(); 
+  genCH1.begin();
+  genCH2.begin();
+
+  // Инициализация Канала 1 (GPIO 10)
   genCH1.setFrequency(MD_AD9833::CHAN_0, frequencyCH1);
   genCH1.setPhase(MD_AD9833::CHAN_0, phaseCH1 * 10);
-  genCH1.setMode(MD_AD9833::MODE_TRIANGLE); // Установка режима ПРЯМОУГОЛЬНИК (меандр)
+  genCH1.setMode(MD_AD9833::MODE_TRIANGLE);
   
-  // Инициализация Канала 2 (GPIO 10)
-  genCH2.begin(); 
+  // Инициализация Канала 2 (GPIO 7)
   genCH2.setFrequency(MD_AD9833::CHAN_0, frequencyCH2);
   genCH2.setPhase(MD_AD9833::CHAN_0, phaseCH2 * 10);
-  genCH2.setMode(MD_AD9833::MODE_TRIANGLE); // Установка режима ПРЯМОУГОЛЬНИК (меандр)
+  genCH2.setMode(MD_AD9833::MODE_TRIANGLE);
+
+  // Both chips share the same SPI control word, so reset release is synchronized.
+  dds_broadcast_control(0x2102);
+  dds_broadcast_control(0x2002);
+
+  if (!channelCH1Enabled) {
+    genCH1.setMode(MD_AD9833::MODE_OFF);
+  }
+  if (!channelCH2Enabled) {
+    genCH2.setMode(MD_AD9833::MODE_OFF);
+  }
 }
 
 void dds_tick() {
